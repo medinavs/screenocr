@@ -7,17 +7,36 @@ import (
 	"math"
 )
 
-// PreprocessForCode applies image preprocessing to improve OCR accuracy.
-// Order matters: invert dark backgrounds first, then scale, sharpen, binarize.
-func PreprocessForCode(img image.Image) *image.Gray {
+// InvertMode controls background inversion behaviour.
+type InvertMode int
+
+const (
+	InvertAuto  InvertMode = iota // detect automatically (default)
+	InvertForce                   // always invert
+	InvertNever                   // never invert
+)
+
+// PreprocessForCode applies the full preprocessing pipeline.
+// invertMode lets callers override the auto-detection (useful for VDI / dark themes).
+func PreprocessForCode(img image.Image, invertMode InvertMode) *image.Gray {
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 	log.Printf("[ocr/preprocess] input: %dx%d", w, h)
 
 	gray := toGrayscale(img)
 
-	gray = InvertIfDarkBackground(gray)
+	// Invert step — must happen before binarization
+	switch invertMode {
+	case InvertForce:
+		log.Println("[ocr/preprocess] force-invert enabled")
+		gray = invertImage(gray)
+	case InvertNever:
+		log.Println("[ocr/preprocess] invert disabled")
+	default:
+		gray = InvertIfDarkBackground(gray)
+	}
 
+	// Scale — Tesseract needs ~32px tall text
 	switch {
 	case h < 400:
 		gray = scaleUp(gray, 4)
@@ -28,6 +47,11 @@ func PreprocessForCode(img image.Image) *image.Gray {
 	}
 	log.Printf("[ocr/preprocess] after scale: %dx%d", gray.Bounds().Dx(), gray.Bounds().Dy())
 
+	// Denoise BEFORE sharpening — removes RDP/VDI compression block artifacts
+	// that would otherwise be amplified by the sharpen kernel.
+	gray = boxBlur(gray, 1)
+
+	// Sharpen to restore edge crispness after blur
 	gray = sharpen(gray)
 
 	gray = stretchContrast(gray)
@@ -53,25 +77,35 @@ func toGrayscale(img image.Image) *image.Gray {
 // InvertIfDarkBackground detects a dark background and inverts so text is dark-on-light.
 func InvertIfDarkBackground(img *image.Gray) *image.Gray {
 	bounds := img.Bounds()
-	var total uint64
 	pixels := bounds.Dx() * bounds.Dy()
+
+	// Count dark vs light pixels (more reliable than mean on VDI compressed images)
+	var dark int
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			total += uint64(img.GrayAt(x, y).Y)
-		}
-	}
-	avg := total / uint64(pixels)
-	if avg < 128 {
-		log.Printf("[ocr/preprocess] dark background (avg=%d), inverting", avg)
-		result := image.NewGray(bounds)
-		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-			for x := bounds.Min.X; x < bounds.Max.X; x++ {
-				result.SetGray(x, y, color.Gray{Y: 255 - img.GrayAt(x, y).Y})
+			if img.GrayAt(x, y).Y < 128 {
+				dark++
 			}
 		}
-		return result
+	}
+	ratio := float64(dark) / float64(pixels)
+
+	if ratio > 0.55 {
+		log.Printf("[ocr/preprocess] dark background (dark ratio=%.2f), inverting", ratio)
+		return invertImage(img)
 	}
 	return img
+}
+
+func invertImage(img *image.Gray) *image.Gray {
+	bounds := img.Bounds()
+	result := image.NewGray(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			result.SetGray(x, y, color.Gray{Y: 255 - img.GrayAt(x, y).Y})
+		}
+	}
+	return result
 }
 
 func scaleUp(img *image.Gray, factor int) *image.Gray {
@@ -87,11 +121,43 @@ func scaleUp(img *image.Gray, factor int) *image.Gray {
 	return scaled
 }
 
-// sharpen applies a 3x3 unsharp kernel to make character edges clearer.
+// boxBlur smooths the image with a (2r+1)×(2r+1) box kernel.
+// Radius 1 → 3×3 kernel, which removes RDP block artifacts without blurring text.
+func boxBlur(img *image.Gray, radius int) *image.Gray {
+	bounds := img.Bounds()
+	result := image.NewGray(bounds)
+	size := (2*radius + 1) * (2*radius + 1)
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			var sum int
+			for dy := -radius; dy <= radius; dy++ {
+				for dx := -radius; dx <= radius; dx++ {
+					nx := x + dx
+					ny := y + dy
+					if nx < bounds.Min.X {
+						nx = bounds.Min.X
+					} else if nx >= bounds.Max.X {
+						nx = bounds.Max.X - 1
+					}
+					if ny < bounds.Min.Y {
+						ny = bounds.Min.Y
+					} else if ny >= bounds.Max.Y {
+						ny = bounds.Max.Y - 1
+					}
+					sum += int(img.GrayAt(nx, ny).Y)
+				}
+			}
+			result.SetGray(x, y, color.Gray{Y: uint8(sum / size)})
+		}
+	}
+	return result
+}
+
+// sharpen applies a Laplacian sharpen kernel to make character edges crisper.
 func sharpen(img *image.Gray) *image.Gray {
 	bounds := img.Bounds()
 	result := image.NewGray(bounds)
-	// Laplacian sharpen kernel: center=5, neighbors=-1
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			if x == bounds.Min.X || x == bounds.Max.X-1 ||
