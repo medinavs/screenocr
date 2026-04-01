@@ -79,9 +79,9 @@ func main() {
 		var text string
 
 		if ollamaEngine != nil {
-			// Ollama receives the raw screenshot — no preprocessing needed
 			log.Println("[main] running Ollama OCR")
 			text, err = ollamaEngine.ProcessImage(img)
+			// fallback to tesseract ocr
 			if err != nil {
 				log.Printf("[main] Ollama failed, falling back to Tesseract: %v", err)
 				preprocessed := ocr.PreprocessForCode(img)
